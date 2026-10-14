@@ -12,14 +12,14 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.Year;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
  * 书籍统计服务：预计算 H5「最新上架」统计数据，写入单行表 books_stat。
+ * 口径：库中不区分借出/加工中/上架，统一按已上架（status = 1）处理，仅下架（3）不计入。
  * 写入规则：
- * - 新书总数：1 条 SQL（status=1 且 releasedAt 落在新书年份内）
- * - 每类总数：每个中图法大类 1 条 SQL（共 22 条，前缀匹配可走索引）
+ * - 新书总数：1 条 SQL（status = 1 且 releasedAt 落在新书年份内）
+ * - 每类总数：每个中图法大类 1 条 SQL（共 22 条，category_first 等值匹配走索引）
  * 更新时机：
  * - 后台导入书籍成功后全量更新（refreshAll）
  * - 后台上下架书籍后更新对应类别（refreshCategory，同时刷新总数）
@@ -36,9 +36,6 @@ public class StatsService {
             "N", "O", "P", "Q", "R", "S", "T", "U", "V", "X", "Z"
     };
 
-    /** 统计范围状态：1 已上架 / 2 加工中 / 4 借出（与 H5 列表展示范围一致，仅排除已下架） */
-    public static final List<Integer> VISIBLE_STATUS = List.of(1, 2, 4);
-
     private final BookRepository bookRepository;
     private final BooksStatRepository booksStatRepository;
 
@@ -47,14 +44,14 @@ public class StatsService {
     public BooksStat refreshAll() {
         LocalDateTime max = bookRepository.findMaxReleasedAt();
         int year = (max == null) ? Year.now().getValue() : max.getYear();
-        long total = bookRepository.countOnShelfByYear(yearStart(year), yearEnd(year), VISIBLE_STATUS);
+        long total = bookRepository.countOnShelfByYear(yearStart(year), yearEnd(year));
 
         BooksStat stat = getOrCreate();
         stat.setStatYear(year);
         stat.setTotalCount(total);
         for (String code : CAT_CODES) {
             setCount(stat, code, (int) bookRepository.countOnShelfByYearAndCategory(
-                    yearStart(year), yearEnd(year), code, VISIBLE_STATUS));
+                    yearStart(year), yearEnd(year), code));
         }
         stat.setUpdatedAt(LocalDateTime.now());
         BooksStat saved = booksStatRepository.save(stat);
@@ -76,8 +73,8 @@ public class StatsService {
         int year = (stat.getStatYear() != null) ? stat.getStatYear() : Year.now().getValue();
 
         setCount(stat, code, (int) bookRepository.countOnShelfByYearAndCategory(
-                yearStart(year), yearEnd(year), code, VISIBLE_STATUS));
-        stat.setTotalCount(bookRepository.countOnShelfByYear(yearStart(year), yearEnd(year), VISIBLE_STATUS));
+                yearStart(year), yearEnd(year), code));
+        stat.setTotalCount(bookRepository.countOnShelfByYear(yearStart(year), yearEnd(year)));
         stat.setUpdatedAt(LocalDateTime.now());
         booksStatRepository.save(stat);
         log.info("书籍统计已局部更新: category={}, total={}", code, stat.getTotalCount());

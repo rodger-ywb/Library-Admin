@@ -27,7 +27,8 @@ import java.util.Map;
 /**
  * H5「最新上架」只读服务：独立于后台业务（不修改 BookService / ImportService）。
  * 仅复用 Book 实体与 BookRepository 做只读查询，统计数据直接读取 books_stat 预计算结果。
- * 展示口径：新书年份（statYear）内、除「已下架(3)」外的书籍全部展示。
+ * 展示口径：新书年份（statYear）内、已上架（status = 1）的书籍展示。
+ * 库中不区分借出/加工中/上架，统一按已上架处理，仅下架（3）不展示。
  */
 @Service
 @RequiredArgsConstructor
@@ -35,9 +36,6 @@ public class H5BookService {
 
     private final BookRepository bookRepository;
     private final StatsService statsService;
-
-    /** 可见状态：1 已上架 / 2 加工中 / 4 借出（仅排除已下架） */
-    private static final List<Integer> VISIBLE_STATUS = List.of(1, 2, 4);
 
     /** 中图法 22 大类（字母 → 全称），按字母序固定输出 */
     private static final Map<String, String> CATEGORY_NAMES = new LinkedHashMap<>();
@@ -67,16 +65,12 @@ public class H5BookService {
         CATEGORY_NAMES.put("Z", "综合性图书");
     }
 
-    /** 状态文案：1 在架 / 2 加工中 / 4 借出中 */
+    /** 状态文案：库中统一按上架处理，仅下架（3）单独标识 */
     private static String statusText(Integer status) {
-        if (status == null) {
-            return "在架";
+        if (status != null && status == 3) {
+            return "已下架";
         }
-        return switch (status) {
-            case 2 -> "加工中";
-            case 4 -> "借出中";
-            default -> "在架";
-        };
+        return "在架";
     }
 
     /** 分类号首字母 → 中图法大类字母（大写） */
@@ -108,7 +102,7 @@ public class H5BookService {
 
     /**
      * 接口二：书单分页。
-     * 范围：新书年份（books_stat.statYear）内、仅排除已下架；按上架日期倒序。
+     * 范围：新书年份（books_stat.statYear）内、已上架（status = 1）；按上架日期倒序。
      */
     public Page<H5BookDTO> books(String category, int page, int size) {
         BooksStat stat = statsService.getCurrent();
@@ -118,7 +112,7 @@ public class H5BookService {
 
         Specification<Book> spec = (root, query, cb) -> {
             var visible = cb.and(
-                    root.get("status").in(VISIBLE_STATUS),
+                    cb.equal(root.get("status"), 1),
                     cb.greaterThanOrEqualTo(root.get("releasedAt"), start),
                     cb.lessThan(root.get("releasedAt"), end));
             if (StringUtils.hasText(category)) {

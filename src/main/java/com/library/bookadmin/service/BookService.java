@@ -49,6 +49,10 @@ public class BookService {
             if (StringUtils.hasText(q.getPublisher())) {
                 predicates.add(cb.like(root.get("publisher"), "%" + escapeLike(q.getPublisher().trim()) + "%"));
             }
+            if (StringUtils.hasText(q.getCategoryFirst())) {
+                // 中图法大类字母精确匹配（统一转大写，与 category_first 存储口径一致）
+                predicates.add(cb.equal(root.get("categoryFirst"), q.getCategoryFirst().trim().toUpperCase()));
+            }
             if (q.getPublishDateStart() != null) {
                 predicates.add(cb.greaterThanOrEqualTo(root.get("publishDate"), q.getPublishDateStart()));
             }
@@ -67,7 +71,8 @@ public class BookService {
             return cb.and(predicates.toArray(new Predicate[0]));
         };
 
-        PageRequest pageRequest = PageRequest.of(page - 1, size, Sort.by(Sort.Direction.DESC, "id"));
+        PageRequest pageRequest = PageRequest.of(page - 1, size,
+                Sort.by(Sort.Direction.DESC, "releasedAt").and(Sort.by(Sort.Direction.DESC, "id")));
         Page<Book> result = bookRepository.findAll(spec, pageRequest);
         return new PageResult<>(result.getContent(), result.getTotalElements(), page, size, result.getTotalPages());
     }

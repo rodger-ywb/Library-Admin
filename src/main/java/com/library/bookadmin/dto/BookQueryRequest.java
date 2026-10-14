@@ -24,6 +24,9 @@ public class BookQueryRequest {
     /** 出版社模糊查询 */
     private String publisher;
 
+    /** 中图法大类字母（category_first，A-Z 精确匹配） */
+    private String categoryFirst;
+
     /** 出版日期范围-起 */
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate publishDateStart;

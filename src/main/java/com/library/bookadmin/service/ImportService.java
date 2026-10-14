@@ -391,7 +391,7 @@ public class ImportService {
             }
         }
 
-        // 状态（可选，默认已上架；任意值均可映射，未知值按已下架处理）
+        // 状态（可选，默认已上架；映射规则：下架→下架，其他一律→上架，不报错）
         String status = cell(row, columnByField, "status");
         if (StringUtils.hasText(status)) {
             Integer code = parseStatus(status);
@@ -594,22 +594,16 @@ public class ImportService {
 
     private Integer parseStatus(String text) {
         String v = text.trim();
-        return switch (v) {
-            case "1", "已上架", "在架" -> 1;
-            case "2", "加工中", "在编" -> 2;
-            case "4", "借出" -> 4;
-            // 其他任何值一律按已下架处理，不报错
-            default -> 3;
-        };
+        // 口径：下架对应下架，其他任何值（在架/在编/借出/未知等）一律按已上架处理
+        if ("下架".equals(v) || "3".equals(v)) {
+            return 3;
+        }
+        return 1;
     }
 
     private String statusText(int code) {
-        return switch (code) {
-            case 1 -> "已上架";
-            case 2 -> "加工中";
-            case 4 -> "借出";
-            default -> "已下架";
-        };
+        // 库中不区分加工中/借出，统一按已上架处理，仅下架单独标识
+        return code == 3 ? "已下架" : "已上架";
     }
 
     private Integer parsePositiveInt(String text) {

@@ -74,8 +74,9 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
-        // 前端本地开发地址（Vite 默认端口），生产环境请改为实际前端域名
-        config.setAllowedOrigins(List.of("http://localhost:5173", "http://127.0.0.1:5173"));
+        // 前端统一通过同源 /api 相对路径 + nginx 反代访问，浏览器仍会携带 Origin 头，
+        // 后端按来源放行：允许所有来源（无状态 JWT + 接口鉴权/防刷，CORS 全放行不构成安全降级）
+        config.setAllowedOriginPatterns(List.of("*"));
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
         config.setAllowCredentials(true);

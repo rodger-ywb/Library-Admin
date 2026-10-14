@@ -23,20 +23,19 @@ public interface BookRepository extends JpaRepository<Book, Long>, JpaSpecificat
     LocalDateTime findMaxReleasedAt();
 
     /**
-     * 新书总数：新书年份内、展示范围状态（1 已上架 / 2 加工中 / 4 借出）的书籍总数（1 条 SQL）。
-     * 统计口径与 H5 列表展示范围一致（VISIBLE_STATUS）。
+     * 新书总数：新书年份内、已上架（status = 1）的书籍总数（1 条 SQL）。
+     * 口径：库中不区分借出/加工中，统一按上架处理，仅下架（3）不计入。
      */
-    @Query("select count(b) from Book b where b.releasedAt >= ?1 and b.releasedAt < ?2 and b.status in ?3")
-    long countOnShelfByYear(LocalDateTime start, LocalDateTime end, Collection<Integer> statuses);
+    @Query("select count(b) from Book b where b.releasedAt >= ?1 and b.releasedAt < ?2 and b.status = 1")
+    long countOnShelfByYear(LocalDateTime start, LocalDateTime end);
 
     /**
-     * 每类书总数：新书年份内某中图法大类、展示范围状态的书籍总数
+     * 每类书总数：新书年份内某中图法大类、已上架（status = 1）的书籍总数
      * （每类 1 条 SQL，category_first 等值匹配走索引）。
      */
     @Query("select count(b) from Book b where b.releasedAt >= ?1 and b.releasedAt < ?2 " +
-            "and b.categoryFirst = ?3 and b.status in ?4")
-    long countOnShelfByYearAndCategory(LocalDateTime start, LocalDateTime end, String code,
-                                       Collection<Integer> statuses);
+            "and b.categoryFirst = ?3 and b.status = 1")
+    long countOnShelfByYearAndCategory(LocalDateTime start, LocalDateTime end, String code);
 
     /** 批量查询库中已存在的书籍（导入幂等：对比字段以决定更新或跳过） */
     @Query("select b from Book b where b.isbn in ?1")
