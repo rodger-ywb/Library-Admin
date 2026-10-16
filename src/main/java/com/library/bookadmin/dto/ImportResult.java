@@ -27,4 +27,10 @@ public class ImportResult {
 
     /** 失败/跳过明细 */
     private List<String> errors;
+
+    /** 大表直导模式：校验未通过（问题数据）行数；小表预览确认流程该字段为 0 */
+    private int invalidRows;
+
+    /** 大表直导模式：校验未通过（问题数据）明细，前端分页展示；小表流程为 null */
+    private List<ImportPreviewRow> invalidData;
 }

@@ -1,9 +1,13 @@
 package com.library.bookadmin.service;
 
 import com.alibaba.excel.EasyExcel;
+import com.alibaba.excel.context.AnalysisContext;
+import com.alibaba.excel.event.AnalysisEventListener;
 import com.library.bookadmin.dto.ImportPreviewResult;
 import com.library.bookadmin.dto.ImportPreviewRow;
 import com.library.bookadmin.dto.ImportResult;
+import com.library.bookadmin.dto.ImportTaskState;
+import com.library.bookadmin.dto.ImportTaskSubmitResult;
 import com.library.bookadmin.entity.Book;
 import com.library.bookadmin.exception.BizException;
 import com.library.bookadmin.repository.BookRepository;
@@ -20,6 +24,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.File;
 import java.io.InputStream;
 import java.time.DateTimeException;
 import java.time.LocalDate;
@@ -45,8 +50,8 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ImportService {
 
-    private static final long MAX_FILE_SIZE = 10L * 1024 * 1024;
-    private static final int MAX_ROWS = 10000;
+    private static final long MAX_FILE_SIZE = 100L * 1024 * 1024;
+    private static final int MAX_ROWS = 1000000;
     private static final Set<String> EXCEL_CONTENT_TYPES = Set.of(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "application/vnd.ms-excel",
@@ -216,6 +221,359 @@ public class ImportService {
         result.setInvalidData(invalid);
         result.setWarnings(warnings);
         return result;
+    }
+
+    // ==================== 大表直导（文件 > 10MB，异步） ====================
+
+    /** 大表导入异步线程池：单线程串行，避免并发大表导入争抢内存与数据库资源 */
+    private final java.util.concurrent.ExecutorService importExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "book-large-import");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** 大表导入任务状态（taskId → 状态；单机内存实现） */
+    private final Map<String, ImportTaskState> importTasks = new ConcurrentHashMap<>();
+
+    @jakarta.annotation.PreDestroy
+    public void shutdownImportExecutor() {
+        importExecutor.shutdown();
+    }
+
+    /**
+     * 大文件（超过 10MB，行数可达数十万）导入：异步受理，接口立即返回。
+     * 文件先落盘临时文件，后台线程流式分批解析导入（每积累 10000 行立即校验并写入，
+     * 随后清空继续读取），内存中只保留 1 万行缓冲，峰值内存与文件总行数无关。
+     * 问题数据（校验失败/写入失败）不回传给前端，逐行写入服务端日志。
+     */
+    public ImportTaskSubmitResult submitLarge(MultipartFile file) {
+        // 1. 文件基础校验
+        String filename = file.getOriginalFilename();
+        if (!StringUtils.hasText(filename) || !isExcelName(filename)) {
+            throw new BizException("仅支持 .xlsx / .xls 格式的 Excel 文件");
+        }
+        String contentType = file.getContentType();
+        if (contentType != null && !EXCEL_CONTENT_TYPES.contains(contentType.toLowerCase())) {
+            throw new BizException("文件类型不正确，请上传 Excel 文件");
+        }
+        if (file.isEmpty()) {
+            throw new BizException("文件内容为空");
+        }
+        if (file.getSize() > MAX_FILE_SIZE) {
+            throw new BizException("文件超过大小限制（最大 100MB）");
+        }
+
+        // 2. 落盘临时文件（MultipartFile 随请求生命周期销毁，后台线程必须从磁盘读取）
+        String taskId = UUID.randomUUID().toString().replace("-", "");
+        String ext = filename.toLowerCase().endsWith(".xls") ? ".xls" : ".xlsx";
+        File tmp = new File(System.getProperty("java.io.tmpdir"), "book-import-" + taskId + ext);
+        try {
+            file.transferTo(tmp);
+        } catch (Exception e) {
+            log.error("大表导入文件落盘失败, file={}", filename, e);
+            throw new BizException("文件保存失败，请重试");
+        }
+
+        // 3. 注册任务状态并提交后台执行
+        ImportTaskState state = new ImportTaskState();
+        state.setStatus("PROCESSING");
+        state.setMessage("正在后台导入中…");
+        importTasks.put(taskId, state);
+
+        importExecutor.execute(() -> {
+            try {
+                ImportResult r = importLargeFromFile(tmp, filename);
+                state.setStatus("SUCCESS");
+                state.setMessage("导入完成");
+                state.setTotal(r.getTotal());
+                state.setSuccess(r.getSuccess());
+                state.setUpdated(r.getUpdated());
+                state.setDuplicate(r.getDuplicate());
+                state.setFailed(r.getFailed());
+                state.setInvalidRows(r.getInvalidRows());
+            } catch (BizException e) {
+                log.error("大表导入失败 taskId={}, file={}: {}", taskId, filename, e.getMessage());
+                state.setStatus("FAILED");
+                state.setMessage(e.getMessage());
+            } catch (Exception e) {
+                log.error("大表导入异常 taskId={}, file={}", taskId, filename, e);
+                state.setStatus("FAILED");
+                state.setMessage("导入异常：" + e.getMessage());
+            } finally {
+                if (!tmp.delete()) {
+                    log.warn("大表导入临时文件删除失败: {}", tmp.getAbsolutePath());
+                }
+            }
+        });
+        return new ImportTaskSubmitResult(taskId, "PROCESSING", "文件已受理，正在后台导入（大文件约需数分钟），问题数据明细将写入服务端日志");
+    }
+
+    /** 查询大表导入任务状态（仅统计数字，不含明细） */
+    public ImportTaskState getImportTask(String taskId) {
+        ImportTaskState state = importTasks.get(taskId);
+        if (state == null) {
+            throw new BizException("导入任务不存在或已过期");
+        }
+        return state;
+    }
+
+    /**
+     * 后台执行大表导入（流式分批）。
+     * 校验失败行、写入失败行逐条写 WARN 日志；汇总写 INFO 日志。
+     */
+    private ImportResult importLargeFromFile(File file, String filename) {
+        LargeFileImporter importer = new LargeFileImporter();
+        try (InputStream in = new java.io.FileInputStream(file)) {
+            EasyExcel.read(in)
+                    .sheet()
+                    .headRowNumber(1)
+                    .registerReadListener(importer)
+                    .doRead();
+        } catch (BizException e) {
+            throw e;
+        } catch (Exception e) {
+            // EasyExcel 会把监听器抛出的业务异常包装为 ExcelAnalysisException，这里解包还原
+            Throwable cause = e;
+            while (cause.getCause() != null && !(cause instanceof BizException)) {
+                cause = cause.getCause();
+            }
+            if (cause instanceof BizException) {
+                throw (BizException) cause;
+            }
+            log.error("Excel 解析失败, file={}", filename, e);
+            throw new BizException("Excel 解析失败，请检查文件是否损坏或格式是否正确");
+        }
+        if (importer.headMap.isEmpty()) {
+            throw new BizException("未读取到表头行，请确认第一行为字段名");
+        }
+
+        // 有写入后全量刷新 H5 统计数据
+        if (importer.success > 0 || importer.updated > 0) {
+            statsService.refreshAll();
+        }
+
+        // 汇总日志：只统计各类条数；isbn为空/isbn非法/作者为空仅计数，
+        // 其他校验异常与写入失败已在上游逐行打印日志
+        log.info("大表导入完成: file={}, 导入={}, 更新={}, 跳过={}, isbn为空={}, isbn非法={}, 作者为空={}, 其他异常={}, 写入失败={}",
+                filename, importer.success, importer.updated, importer.duplicate,
+                importer.isbnEmptyCount, importer.isbnInvalidCount, importer.authorEmptyCount,
+                importer.otherInvalidCount, importer.failed);
+
+        ImportResult result = new ImportResult();
+        result.setTotal(importer.validTotal);
+        result.setSuccess(importer.success);
+        result.setUpdated(importer.updated);
+        result.setDuplicate(importer.duplicate);
+        result.setFailed(importer.failed);
+        result.setErrors(null);
+        result.setInvalidRows(importer.invalidRows);
+        result.setInvalidData(null);
+        return result;
+    }
+
+    /**
+     * 大表直导流式监听器：
+     * 每积累 PARSE_BATCH（10000）行调用一次 processBuffer——行级校验 → 批内 ISBN 去重 →
+     * 分批查库判定 NEW/UPDATE/SKIP → 按 batchSize 分批写入（每批独立事务）→ 清空缓冲继续读取。
+     * 内存中仅保留当前 1 万行缓冲，不整体缓存已有书籍。
+     * 校验失败/写入失败的问题数据逐行写入 WARN 日志，不收集、不回传前端。
+     */
+    private class LargeFileImporter extends AnalysisEventListener<Map<Integer, String>> {
+
+        private static final int PARSE_BATCH = 10000;
+        private static final int IN_BATCH = 500;
+
+        private final Map<Integer, String> headMap = new HashMap<>();
+        private final Map<String, Integer> columnByField = new HashMap<>();
+        private final List<Map<Integer, String>> buffer = new ArrayList<>(PARSE_BATCH);
+
+        private int excelRow = 1;          // 表头占第 1 行，数据行从 2 开始计数
+        private long dataRows = 0;         // 已读取数据行数（用于行数上限校验）
+        private int validTotal = 0;
+        private int success = 0;
+        private int updated = 0;
+        private int duplicate = 0;
+        private int failed = 0;
+        private int invalidRows = 0;
+        private int isbnEmptyCount = 0;
+        private int isbnInvalidCount = 0;
+        private int authorEmptyCount = 0;
+        private int otherInvalidCount = 0;
+
+        @Override
+        public void invokeHeadMap(Map<Integer, String> headMap, AnalysisContext context) {
+            this.headMap.putAll(headMap);
+            headMap.forEach((colIdx, headerText) -> {
+                String field = BookFieldMapping.matchField(headerText);
+                if (field != null) {
+                    columnByField.putIfAbsent(field, colIdx);
+                }
+            });
+            if (!columnByField.containsKey("isbn") || !columnByField.containsKey("title")) {
+                throw new BizException("模板必须包含「ISBN」与「书名」两列（表头需与字段名对应）");
+            }
+        }
+
+        @Override
+        public void invoke(Map<Integer, String> data, AnalysisContext context) {
+            excelRow++;
+            dataRows++;
+            if (dataRows > MAX_ROWS) {
+                throw new BizException("单次导入最多支持 " + MAX_ROWS + " 行数据");
+            }
+            buffer.add(data);
+            if (buffer.size() >= PARSE_BATCH) {
+                processBuffer();
+            }
+        }
+
+        @Override
+        public void doAfterAllAnalysed(AnalysisContext context) {
+            if (!buffer.isEmpty()) {
+                processBuffer();
+            }
+        }
+
+        /** 校验并导入当前 1 万行缓冲，随后清空 */
+        private void processBuffer() {
+            List<Map<Integer, String>> rows = new ArrayList<>(buffer);
+            buffer.clear();
+            int baseRow = excelRow - rows.size();
+
+            // 1) 行级校验：valid 待写入；无效行按问题分类统计——
+            //    isbn为空 / isbn非法 / 作者为空 仅计数不打日志；
+            //    其余校验异常（书名空、日期格式错、字段超长等）计数并逐行打印日志
+            List<ImportPreviewRow> valid = new ArrayList<>(rows.size());
+            for (int i = 0; i < rows.size(); i++) {
+                Map<Integer, String> row = rows.get(i);
+                if (isEmptyRow(row)) {
+                    continue;
+                }
+                ImportPreviewRow pr = validateRow(row, columnByField, baseRow + i + 1);
+                if (pr.isValid()) {
+                    valid.add(pr);
+                } else {
+                    invalidRows++;
+                    String isbnRaw = normalizeIsbn(cell(row, columnByField, "isbn"));
+                    String authorRaw = cell(row, columnByField, "author");
+                    boolean isbnEmpty = !StringUtils.hasText(isbnRaw);
+                    boolean isbnBad = !isbnEmpty && !isbnRaw.matches("\\d{13}|\\d{9}[0-9Xx]?");
+                    boolean authorEmpty = !StringUtils.hasText(authorRaw);
+                    if (isbnEmpty) {
+                        isbnEmptyCount++;
+                    }
+                    if (isbnBad) {
+                        isbnInvalidCount++;
+                    }
+                    if (authorEmpty) {
+                        authorEmptyCount++;
+                    }
+                    // 非 isbn 空/非法、非作者空的校验失败（书名空、日期格式错、超长等）→ 其他异常，打印日志
+                    if (!isbnEmpty && !isbnBad && !authorEmpty) {
+                        otherInvalidCount++;
+                        log.warn("大表导入-其他校验异常 [行 {}] ISBN={} 书名={} 原因={}",
+                                pr.getRowNum(), pr.getIsbn(), brief(pr.getTitle()), pr.getErrorMessage());
+                    }
+                }
+            }
+            if (valid.isEmpty()) {
+                return;
+            }
+
+            // 2) 批内 ISBN 去重（同一 ISBN 复本以本批最后一行数据为准）
+            Map<String, ImportPreviewRow> dedup = new LinkedHashMap<>();
+            for (ImportPreviewRow r : valid) {
+                dedup.put(r.getIsbn(), r);
+            }
+            List<ImportPreviewRow> unique = new ArrayList<>(dedup.values());
+            validTotal += unique.size();
+
+            // 3) 幂等判定：IN 分批查库（每批 500），NEW=新增 / UPDATE=字段有变更 / SKIP=无变更
+            List<String> isbns = unique.stream().map(ImportPreviewRow::getIsbn).distinct().collect(Collectors.toList());
+            Map<String, Book> existing = new HashMap<>();
+            for (int i = 0; i < isbns.size(); i += IN_BATCH) {
+                List<String> part = isbns.subList(i, Math.min(i + IN_BATCH, isbns.size()));
+                for (Book b : bookRepository.findExistingBooksByIsbnIn(part)) {
+                    existing.put(b.getIsbn(), b);
+                }
+            }
+            for (ImportPreviewRow r : unique) {
+                Book exist = existing.get(r.getIsbn());
+                if (exist == null) {
+                    r.setImportMode("NEW");
+                    r.setModeText("新增");
+                } else {
+                    r.setIsbnExists(true);
+                    List<String> changed = changedFields(exist, r);
+                    if (changed.isEmpty()) {
+                        r.setImportMode("SKIP");
+                        r.setModeText("跳过");
+                    } else {
+                        r.setImportMode("UPDATE");
+                        r.setModeText("更新");
+                        r.setUpdateReason(String.join("、", changed));
+                    }
+                }
+            }
+
+            // 4) 分批写入（batchSize 每批独立事务）；失败原因逐行写 WARN 日志
+            for (int i = 0; i < unique.size(); i += batchSize) {
+                List<ImportPreviewRow> batch = unique.subList(i, Math.min(i + batchSize, unique.size()));
+                BatchResult br = transactionTemplate.execute(status -> saveBatchDirect(batch, existing));
+                success += br.success;
+                updated += br.updated;
+                duplicate += br.duplicate;
+                failed += br.failed;
+                for (String e : br.errors) {
+                    log.warn("大表导入-写入问题: {}", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * 大表直导批次写入（同一事务内执行）。
+     * NEW 不再做批内/库内二次 exists 检查：批内已按 ISBN 去重且统一查库判定过，
+     * 唯一键冲突由 DataIntegrityViolationException 兜底转为跳过，避免逐条 exists 查询拖慢数十万行导入。
+     */
+    private BatchResult saveBatchDirect(List<ImportPreviewRow> batch, Map<String, Book> existingBooks) {
+        int success = 0;
+        int updated = 0;
+        int duplicate = 0;
+        int failed = 0;
+        List<String> errors = new ArrayList<>();
+
+        for (ImportPreviewRow row : batch) {
+            String isbn = row.getIsbn();
+            try {
+                String mode = row.getImportMode() == null ? "NEW" : row.getImportMode();
+                if ("UPDATE".equals(mode)) {
+                    Book exist = existingBooks.get(isbn);
+                    if (exist == null) {
+                        duplicate++;
+                        errors.add("第 " + row.getRowNum() + " 行：ISBN " + isbn + " 已不存在，已跳过");
+                        continue;
+                    }
+                    applyRow(exist, row);
+                    bookRepository.save(exist);
+                    updated++;
+                } else if ("SKIP".equals(mode)) {
+                    duplicate++;
+                } else {
+                    bookRepository.save(toBook(row));
+                    success++;
+                }
+            } catch (DataIntegrityViolationException e) {
+                duplicate++;
+                errors.add("第 " + row.getRowNum() + " 行：ISBN " + isbn + " 已存在，已跳过");
+            } catch (Exception e) {
+                failed++;
+                errors.add("第 " + row.getRowNum() + " 行（《" + brief(row.getTitle()) + "》，ISBN " + isbn + "）：写入失败，请检查该行数据");
+                log.warn("大表直导单行写入失败 row={}", row.getRowNum(), e);
+            }
+        }
+        return new BatchResult(success, updated, duplicate, failed, errors);
     }
 
     // ==================== 确认导入 ====================
@@ -391,7 +749,7 @@ public class ImportService {
             }
         }
 
-        // 状态（可选，默认已上架；映射规则：下架→下架，其他一律→上架，不报错）
+        // 状态（可选，默认已上架；映射规则：上架/在架/借出 → 上架，其余（在编/加工中/下架/未知等）→ 下架，不报错）
         String status = cell(row, columnByField, "status");
         if (StringUtils.hasText(status)) {
             Integer code = parseStatus(status);
@@ -594,11 +952,12 @@ public class ImportService {
 
     private Integer parseStatus(String text) {
         String v = text.trim();
-        // 口径：下架对应下架，其他任何值（在架/在编/借出/未知等）一律按已上架处理
-        if ("下架".equals(v) || "3".equals(v)) {
-            return 3;
+        // 口径：上架/在架/借出 → 已上架(1)；其他（在编/加工中/下架/未知等）一律 → 已下架(3)
+        if ("上架".equals(v) || "已上架".equals(v) || "在架".equals(v)
+                || "借出".equals(v) || "1".equals(v) || "4".equals(v)) {
+            return 1;
         }
-        return 1;
+        return 3;
     }
 
     private String statusText(int code) {
